@@ -9,27 +9,37 @@ import (
 )
 
 const (
-	// Путь к архиву. Если скрипт лежит рядом с папкой архива, оставьте "." или укажите имя папки
-	// Например: "./ucoz_archive" или "C:/Users/User/Desktop/ucoz_backup"
-	rootPath = "." 
-	// Максимальное количество файлов/папок для показа в одной директории
-	maxItemsPerDir = 10
+	rootPath           = "."
+	maxVisibleFiles    = 3  // Сколько файлов показывать перед скрытием (для не-картинок)
+	maxVisibleImages   = 2  // Сколько картинок показывать перед скрытием
 )
 
+// Расширения, которые считаем "шумом" (массовые файлы)
+var imageExts = map[string]bool{
+	".jpg":  true,
+	".jpeg": true,
+	".png":  true,
+	".gif":  true,
+	".bmp":  true,
+	".webp": true,
+}
+
 type Stats struct {
-	TotalDirs  int
-	TotalFiles int
-	TotalSize  int64
-	Extensions map[string]int
+	TotalDirs      int
+	TotalFiles     int
+	TotalImages    int
+	TotalContent   int // Файлы, которые не картинки
+	TotalSize      int64
+	Extensions     map[string]int
+	ImportantFiles []string // Список важных файлов (не картинки) для быстрого просмотра
 }
 
 func main() {
-	fmt.Println("=== Анализ структуры Ucoz архива ===")
+	fmt.Println("=== Глубокий анализ структуры Ucoz архива ===")
+	fmt.Println("(Показываем все папки, скрываем множественные JPG/PNG)")
 	
-	// Проверка существования пути
 	if _, err := os.Stat(rootPath); os.IsNotExist(err) {
 		fmt.Printf("Ошибка: Путь '%s' не найден.\n", rootPath)
-		fmt.Println("Пожалуйста, распакуйте архив в эту папку или измените переменную rootPath в коде.")
 		return
 	}
 
@@ -37,10 +47,9 @@ func main() {
 		Extensions: make(map[string]int),
 	}
 
-	fmt.Printf("\nСканирование начиная с: %s\n", filepath.ToSlash(rootPath))
+	fmt.Printf("\nСканирование: %s\n", filepath.ToSlash(rootPath))
 	fmt.Println("--------------------------------------------------")
 	
-	// Запуск рекурсивного обхода
 	err := scanDirectory(rootPath, 0, stats)
 	if err != nil {
 		fmt.Printf("Ошибка при сканировании: %v\n", err)
@@ -51,21 +60,18 @@ func main() {
 }
 
 func scanDirectory(path string, depth int, stats *Stats) error {
-	// Ограничение глубины, если нужно (сейчас без ограничений по глубине)
-	
 	entries, err := os.ReadDir(path)
 	if err != nil {
-		// Игнорируем ошибки доступа к некоторым системным папкам, но выводим предупреждение
 		if os.IsPermission(err) {
 			return nil
 		}
 		return err
 	}
 
-	// Разделяем папки и файлы для сортировки
 	var dirs []os.DirEntry
 	var files []os.DirEntry
 
+	// Разделяем папки и файлы
 	for _, entry := range entries {
 		if entry.IsDir() {
 			dirs = append(dirs, entry)
@@ -74,65 +80,92 @@ func scanDirectory(path string, depth int, stats *Stats) error {
 		}
 	}
 
-	// Сортируем по имени для стабильного вывода
+	// Сортируем для стабильного вывода
 	sort.Slice(dirs, func(i, j int) bool { return dirs[i].Name() < dirs[j].Name() })
 	sort.Slice(files, func(i, j int) bool { return files[i].Name() < files[j].Name() })
 
-	// --- Печать текущей директории ---
 	indent := strings.Repeat("  ", depth)
 	
-	// Показываем имя текущей папки (для корня можно не показывать или показать особым образом)
-	if depth > 0 {
-		fmt.Printf("%s📁 %s/\n", indent, filepath.Base(path))
-	} else {
-		fmt.Printf("📂 %s (Корень)\n", filepath.Base(path))
+	// Вывод имени текущей папки
+	dirName := filepath.Base(path)
+	if depth == 0 {
+		dirName = dirName + " (Корень)"
 	}
+	fmt.Printf("%s📁 %s/\n", indent, dirName)
 
-	// Обработка папок
-	displayedDirs := 0
+	// 1. Рекурсивно обрабатываем ВСЕ папки (без ограничений по количеству)
 	for _, d := range dirs {
-		if displayedDirs >= maxItemsPerDir {
-			remaining := len(dirs) - displayedDirs
-			fmt.Printf("%s  ... и ещё %d папок(-ки)\n", indent, remaining)
-			break
-		}
-		
-		// Рекурсивный вызов
 		nextPath := filepath.Join(path, d.Name())
 		err := scanDirectory(nextPath, depth+1, stats)
 		if err != nil {
-			fmt.Printf("%s  Ошибка доступа к папке: %v\n", indent, err)
+			fmt.Printf("%s  [Ошибка доступа: %v]\n", indent, err)
 		}
-		displayedDirs++
 	}
 
-	// Обработка файлов
-	displayedFiles := 0
-	for _, f := range files {
-		if displayedFiles >= maxItemsPerDir {
-			remaining := len(files) - displayedFiles
-			fmt.Printf("%s  ... и ещё %d файл(ов)\n", indent, remaining)
-			break
-		}
+	// 2. Обрабатываем файлы
+	// Разделяем на картинки и остальное
+	var contentFiles []os.DirEntry
+	var imageFiles []os.DirEntry
 
+	for _, f := range files {
+		ext := strings.ToLower(filepath.Ext(f.Name()))
+		if imageExts[ext] {
+			imageFiles = append(imageFiles, f)
+		} else {
+			contentFiles = append(contentFiles, f)
+		}
+	}
+
+	// --- Вывод контентных файлов (HTML, TXT, PHP и т.д.) ---
+	displayedContent := 0
+	for _, f := range contentFiles {
 		info, err := f.Info()
 		size := int64(0)
 		if err == nil {
 			size = info.Size()
 			stats.TotalFiles++
+			stats.TotalContent++
 			stats.TotalSize += size
 			
-			// Сбор статистики по расширениям
 			ext := strings.ToLower(filepath.Ext(info.Name()))
-			if ext == "" {
-				ext = "[без расширения]"
-			}
+			if ext == "" { ext = "[no_ext]" }
 			stats.Extensions[ext]++
+			
+			// Сохраняем важные файлы для статистики
+			if stats.TotalContent <= 20 && ext != ".go" {
+				stats.ImportantFiles = append(stats.ImportantFiles, filepath.Join(path, f.Name()))
+			}
 		}
 
-		sizeStr := formatSize(size)
-		fmt.Printf("%s  📄 %s (%s)\n", indent, f.Name(), sizeStr)
-		displayedFiles++
+		if displayedContent < maxVisibleFiles {
+			fmt.Printf("%s  📄 %s (%s)\n", indent, f.Name(), formatSize(size))
+			displayedContent++
+		}
+	}
+	if len(contentFiles) > maxVisibleFiles {
+		fmt.Printf("%s  ... и ещё %d файл(ов) (текст/код)\n", indent, len(contentFiles)-maxVisibleFiles)
+	}
+
+	// --- Вывод файлов изображений (сокращенно) ---
+	displayedImages := 0
+	for _, f := range imageFiles {
+		info, err := f.Info()
+		size := int64(0)
+		if err == nil {
+			size = info.Size()
+			stats.TotalFiles++
+			stats.TotalImages++
+			stats.TotalSize += size
+			stats.Extensions[strings.ToLower(filepath.Ext(info.Name()))]++
+		}
+
+		if displayedImages < maxVisibleImages {
+			fmt.Printf("%s  🖼️  %s (%s)\n", indent, f.Name(), formatSize(size))
+			displayedImages++
+		}
+	}
+	if len(imageFiles) > maxVisibleImages {
+		fmt.Printf("%s  ... и ещё %d изображений\n", indent, len(imageFiles)-maxVisibleImages)
 	}
 	
 	stats.TotalDirs++
@@ -142,19 +175,20 @@ func scanDirectory(path string, depth int, stats *Stats) error {
 func printStats(s *Stats) {
 	fmt.Println("\n==================================================")
 	fmt.Println("ИТОГОВАЯ СТАТИСТИКА:")
-	fmt.Printf("Всего папок:     %d\n", s.TotalDirs)
-	fmt.Printf("Всего файлов:    %d\n", s.TotalFiles)
-	fmt.Printf("Общий размер:    %s\n", formatSize(s.TotalSize))
+	fmt.Printf("Всего папок:       %d\n", s.TotalDirs)
+	fmt.Printf("Всего файлов:      %d\n", s.TotalFiles)
+	fmt.Printf("  - Изображения:   %d\n", s.TotalImages)
+	fmt.Printf("  - Контент:       %d\n", s.TotalContent)
+	fmt.Printf("Общий размер:      %s\n", formatSize(s.TotalSize))
 	
-	fmt.Println("\nТоп расширений файлов:")
-	
-	// Сортировка расширений по количеству
+	fmt.Println("\nТоп расширений (кроме картинок):")
 	type kv struct {
 		Key   string
 		Value int
 	}
 	var sortedExt []kv
 	for k, v := range s.Extensions {
+		if imageExts[k] { continue } // Пропускаем картинки в топе
 		sortedExt = append(sortedExt, kv{k, v})
 	}
 	sort.Slice(sortedExt, func(i, j int) bool {
@@ -163,14 +197,16 @@ func printStats(s *Stats) {
 
 	count := 0
 	for _, e := range sortedExt {
-		if count >= 15 { // Показываем топ-15
-			break
-		}
+		if count >= 15 { break }
 		fmt.Printf("  %-10s : %d шт.\n", e.Key, e.Value)
 		count++
 	}
-	if len(sortedExt) > 15 {
-		fmt.Println("  ... и другие")
+
+	if len(s.ImportantFiles) > 0 {
+		fmt.Println("\nПримеры найденных контентных файлов:")
+		for _, f := range s.ImportantFiles {
+			fmt.Printf("  - %s\n", f)
+		}
 	}
 }
 
